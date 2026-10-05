@@ -4,6 +4,7 @@ import type { NextFunction, Request, Response } from "express";
 import {
   BadGatewayError,
   BadRequestError,
+  ForbiddenError,
   GatewayTimeoutError,
   NotFoundError,
   PaymentRequiredError,
@@ -12,9 +13,11 @@ import {
 } from "../../errors/index.js";
 import { logger } from "../../logger.js";
 import {
+  BILLING_DEDUCT_SCOPE,
   requireAuth,
   type AuthenticatedLocals,
 } from "../../middleware/requireAuth.js";
+import { requireAuthOrAdmin } from "../../middleware/adminAuth.js";
 import { idempotencyMiddleware } from "../../middleware/idempotency.js";
 import { billingDeductHistogramMiddleware } from "../../middleware/metricsHistogram.js";
 import { SorobanRpcError } from "../../services/sorobanBilling.js";
@@ -96,7 +99,7 @@ function simulationFailureError(
 
 router.post(
   "/",
-  requireAuth,
+  requireAuthOrAdmin,
   idempotencyHandler,
   billingDeductHistogramMiddleware,
   async (
@@ -122,12 +125,37 @@ router.post(
         body.idempotencyKey.trim() !== ""
           ? body.idempotencyKey.trim()
           : (req.get("Idempotency-Key") ?? undefined);
-      const developerId = Object.prototype.hasOwnProperty.call(
+      const requestedDeveloperId = Object.prototype.hasOwnProperty.call(
         body,
         "developerId",
       )
         ? requireString(body.developerId, "developerId")
         : user.id;
+
+      // Default-deny cross-user deductions. An authenticated caller may only
+      // deduct from their own balance unless they are an admin or a service
+      // principal holding the explicit billing scope.
+      if (requestedDeveloperId !== user.id) {
+        const isAdmin = res.locals.authenticatedAdmin === true;
+        const service = res.locals.authenticatedService;
+        const hasBillingScope =
+          service?.isService === true &&
+          service.scopes.includes(BILLING_DEDUCT_SCOPE);
+        if (!isAdmin && !hasBillingScope) {
+          logger.audit("billing.deduct.cross_user_rejected", user.id, {
+            target: requestedDeveloperId,
+          });
+          next(
+            new ForbiddenError(
+              "Cannot deduct from another user's balance",
+              "FORBIDDEN",
+            ),
+          );
+          return;
+        }
+      }
+
+      const developerId = requestedDeveloperId;
 
       const billingService = getBillingService(req);
       const result = await billingService.deduct({

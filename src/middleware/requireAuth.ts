@@ -1,5 +1,5 @@
 import type { NextFunction, Request, Response } from "express";
-import jwt from "jsonswebtoken";
+import jwt from "jsonwebtoken";
 import crypto from "node:crypto";
 
 import type { AuthenticatedUser } from "../types/auth.js";
@@ -10,10 +10,15 @@ import { logger } from "../logger.js";
 export type AuthenticatedLocals = {
   authenticatedUser?: AuthenticatedUser;
   authenticatedService?: AuthenticatedService;
+  authenticatedAdmin?: boolean;
+  adminActor?: string;
 };
 
 /** Restrict accepted signing algorithms to prevent algorithm-confusion attacks. */
-export const ALLOWED_ALGORITHMS: jsonswebtoken.Algorithm[] = ["HS256"];
+export const ALLOWED_ALGORITHMS: jwt.Algorithm[] = ["HS256"];
+
+/** Scope that authorises a service principal to deduct on a user's behalf. */
+export const BILLING_DEDUCT_SCOPE = "billing:deduct";
 
 /**
  * Authenticated service principal derived from a bearer token.
@@ -23,6 +28,21 @@ export interface AuthenticatedService {
   id: string;
   scopes: string[];
   isService: true;
+}
+
+/**
+ * Normalise the `scopes`/`scope` claims of a verified JWT payload into a
+ * de-duplicated list of scope strings. Accepts an array or a space/comma
+ * separated string.
+ */
+function extractScopes(payload: Record<string, unknown>): string[] {
+  const raw = payload.scopes ?? payload.scope;
+  const scopes = Array.isArray(raw)
+    ? raw.filter((value): value is string => typeof value === "string")
+    : typeof raw === "string"
+      ? raw.split(/[\s,]+/)
+      : [];
+  return Array.from(new Set(scopes.filter((scope) => scope.length > 0)));
 }
 
 export interface ResolvedRequestUserId {
@@ -120,7 +140,7 @@ export function resolveRequestJwtUserId(req: Request): ResolvedRequestJwtUserId 
         };
       }
 
-      const payload = decoded as Record<unknown>;
+      const payload = decoded as Record<string, unknown>;
       const uid = payload.userId || payload.sub;
 
       if (typeof uid !== "string" || uid.trim() === "") {
@@ -208,7 +228,7 @@ export function resolveRequestService(req: Request): AuthenticatedService | null
 
     if (typeof decoded === "string" || !decoded) return null;
 
-    const payload = decoded as Record<unknown>;
+    const payload = decoded as Record<string, unknown>;
     if (payload.type !== "service") return null;
 
     const uid = payload.userId || payload.sub;
